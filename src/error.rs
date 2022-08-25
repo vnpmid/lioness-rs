@@ -20,8 +20,8 @@ impl fmt::Display for LionessError {
     }
 }
 
-impl From<keystream::Error> for LionessError {
-    fn from(_: keystream::Error) -> LionessError {
+impl From<chacha20::cipher::StreamCipherError> for LionessError {
+    fn from(_: chacha20::cipher::StreamCipherError) -> LionessError {
         LionessError::BlockSizeError // EndReached is a block size error
     }
 }
@@ -31,7 +31,7 @@ impl Error for LionessError {
         "I'm a Lioness error."
     }
 
-    fn cause(&self) -> Option<&Error> {
+    fn cause(&self) -> Option<&dyn Error> {
         use self::LionessError::*;
         match *self {
             BlockSizeError => None,

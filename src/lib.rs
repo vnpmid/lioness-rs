@@ -5,19 +5,18 @@
 #[macro_use]
 extern crate arrayref;
 
-extern crate chacha;
+extern crate chacha20;
 extern crate blake2;
-extern crate keystream;
+extern crate digest;
 
 #[cfg(test)]
 extern crate rand;
 #[cfg(test)]
 extern crate hex;
 
-
-use keystream::KeyStream;
-use chacha::ChaCha;
-use blake2::{VarBlake2b, digest::{Input, VariableOutput}};
+use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+use blake2::Blake2bMac;
+use digest::{KeyInit, Update, FixedOutput, consts::U32};
 
 pub mod error;
 pub use error::LionessError;
@@ -28,23 +27,28 @@ pub const DIGEST_RESULT_SIZE: usize = 32;
 pub const DIGEST_KEY_SIZE: usize = 64;
 pub const STREAM_CIPHER_KEY_SIZE: usize = 32;
 pub const RAW_KEY_SIZE: usize = 2*STREAM_CIPHER_KEY_SIZE + 2*DIGEST_KEY_SIZE;
-const CHACHA20_NONCE_SIZE: usize = 8;
+
+type Blake2bMac256 = Blake2bMac<U32>;
+type ChaCha = ChaCha20;
 
 /// Adapt a given `crypto::digest::Digest` to Lioness.
-pub trait DigestLioness : Input+VariableOutput {
-    fn new_digest_lioness(k: &[u8]) -> Self;
+pub trait DigestLioness : KeyInit+Update+FixedOutput {
+	
+    fn new_digest_lioness(key: &[u8]) -> Self;
+	
 }
 
-impl DigestLioness for VarBlake2b {
-    fn new_digest_lioness(k: &[u8]) -> Self {
-        VarBlake2b::new_keyed(k,DIGEST_RESULT_SIZE)
+impl DigestLioness for Blake2bMac256 {
+	
+    fn new_digest_lioness(key: &[u8]) -> Blake2bMac256 {
+        Blake2bMac256::new_from_slice(&key).unwrap()
     }
 }
 
 
 /// Adapt a given `crypto::symmetriccipher::KeyStream`
 /// to lioness.
-pub trait StreamCipherLioness : KeyStream {
+pub trait StreamCipherLioness : KeyIvInit+StreamCipher {
     fn new_streamcipher_lioness(k: &[u8; STREAM_CIPHER_KEY_SIZE]) -> Self;
 }
 
@@ -52,15 +56,15 @@ impl StreamCipherLioness for ChaCha {
     fn new_streamcipher_lioness(k: &[u8; STREAM_CIPHER_KEY_SIZE]) -> ChaCha {
         // here we intentionally initialize the ChaCha20 stream cipher with
         // an 8 byte zero nonce which is sufficient in the context of Lioness
-        ChaCha::new_chacha20(k, &[0u8;CHACHA20_NONCE_SIZE])
+        ChaCha::new(k.into(), &Default::default())
     }
 }
 
 
 /// Lioness implemented generically over a Digest and StreamCipher
 pub struct Lioness<H,SC>
-where H: DigestLioness+Input+VariableOutput, 
-      SC: StreamCipherLioness+KeyStream {
+where H: DigestLioness+KeyInit+Update+FixedOutput, 
+      SC: StreamCipherLioness+KeyIvInit+StreamCipher {
     k1: [u8; STREAM_CIPHER_KEY_SIZE],
     k2: [u8; DIGEST_KEY_SIZE],
     k3: [u8; STREAM_CIPHER_KEY_SIZE],
@@ -70,8 +74,8 @@ where H: DigestLioness+Input+VariableOutput,
 }
 
 impl<H,SC> Lioness<H,SC>
-where H: DigestLioness+Input+VariableOutput,
-      SC: StreamCipherLioness+KeyStream
+where H: DigestLioness+KeyInit+Update+FixedOutput,
+      SC: StreamCipherLioness+KeyIvInit+StreamCipher
 {
     /// encrypt a block
     ///
@@ -87,12 +91,18 @@ where H: DigestLioness+Input+VariableOutput,
     ///
     /// ```
     /// extern crate blake2;
-    /// extern crate chacha;
+    /// extern crate chacha20;
+	/// extern crate digest;
     /// extern crate lioness;
     /// extern crate hex;
     /// use self::lioness::{Lioness, RAW_KEY_SIZE};
-    /// use chacha::ChaCha;
-    /// use blake2::VarBlake2b;
+    /// use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+    /// use blake2::Blake2bMac;
+	/// use digest::{KeyInit, Update, FixedOutput, consts::U32};
+	///
+	/// type Blake2bMac256 = Blake2bMac<U32>;
+    /// type ChaCha = ChaCha20;
+	///
     /// # #[macro_use] extern crate arrayref; fn main() {
     ///
     /// let key = hex::decode(
@@ -115,13 +125,13 @@ where H: DigestLioness+Input+VariableOutput,
     /// rights.";
     ///
     /// let mut block: Vec<u8> = PLAINTEXT.to_owned();
-    /// let cipher = Lioness::<VarBlake2b,ChaCha>::new_raw(array_ref!(key, 0, RAW_KEY_SIZE));
+    /// let cipher = Lioness::<Blake2bMac256,ChaCha>::new_raw(array_ref!(key, 0, RAW_KEY_SIZE));
     /// cipher.encrypt(&mut block).unwrap();
     /// }
     /// ```
     pub fn encrypt(&self, block: &mut [u8]) -> Result<(), LionessError> {
         debug_assert!(DIGEST_RESULT_SIZE == STREAM_CIPHER_KEY_SIZE);
-        // let mut hr = [0u8; DIGEST_RESULT_SIZE];
+        let mut hr : [u8; DIGEST_RESULT_SIZE];
         let mut k = [0u8; STREAM_CIPHER_KEY_SIZE];
         let keylen = std::mem::size_of_val(&k);
         debug_assert!(keylen == 32);
@@ -136,22 +146,24 @@ where H: DigestLioness+Input+VariableOutput,
         // R = R ^ S(L ^ K1)
         xor(left, &self.k1, &mut k);
         let mut sc = SC::new_streamcipher_lioness(&k);
-        sc.xor_read(right) ?;
+        sc.apply_keystream(right);
 
         // L = L ^ H(K2, R)
         let mut h = H::new_digest_lioness(&self.k2);
-        h.input(&mut *right);
-        h.variable_result(|hr| xor_assign(left,&hr));
+        h.update(&mut *right);
+        hr = h.finalize_fixed().as_slice().try_into().expect("slice with incorrect length");
+		xor_assign(left,&hr);
 
         // R = R ^ S(L ^ K3)
         xor(left, &self.k3, &mut k);
         let mut sc = SC::new_streamcipher_lioness(&k);
-        sc.xor_read(right) ?;
+        sc.apply_keystream(right);
 
         // L = L ^ H(K4, R)
         let mut h = H::new_digest_lioness(&self.k4);
-        h.input(&mut *right);
-        h.variable_result(|hr| xor_assign(left,&hr));
+        h.update(&mut *right);
+        hr = h.finalize_fixed().as_slice().try_into().expect("slice with incorrect length");
+		xor_assign(left,&hr);
 
         Ok(())
     }
@@ -168,7 +180,7 @@ where H: DigestLioness+Input+VariableOutput,
     ///
     pub fn decrypt(&self, block: &mut [u8]) -> Result<(), LionessError> {
         debug_assert!(DIGEST_RESULT_SIZE == STREAM_CIPHER_KEY_SIZE);
-        // let mut hr = [0u8; DIGEST_RESULT_SIZE];
+        let mut hr : [u8; DIGEST_RESULT_SIZE];
         let mut k = [0u8; STREAM_CIPHER_KEY_SIZE];
         let keylen = std::mem::size_of_val(&k);
         debug_assert!(keylen == 32);
@@ -182,23 +194,25 @@ where H: DigestLioness+Input+VariableOutput,
 
         // L = L ^ H(K4, R)
         let mut h = H::new_digest_lioness(&self.k4);
-        h.input(&mut *right);
-        h.variable_result(|hr| xor_assign(left,&hr));
+        h.update(&mut *right);
+        hr = h.finalize_fixed().as_slice().try_into().expect("slice with incorrect length");
+		xor_assign(left,&hr);
 
         // R = R ^ S(L ^ K3)
         xor(left, &self.k3, &mut k);
         let mut sc = SC::new_streamcipher_lioness(&k);
-        sc.xor_read(right) ?;
+        sc.apply_keystream(right);
 
         // L = L ^ H(K2, R)
         let mut h = H::new_digest_lioness(&self.k2);
-        h.input(&mut *right);
-        h.variable_result(|hr| xor_assign(left,&hr));
+        h.update(&mut *right);
+		hr = h.finalize_fixed().as_slice().try_into().expect("slice with incorrect length");
+		xor_assign(left,&hr);
 
         // R = R ^ S(L ^ K1)
         xor(left, &self.k1, &mut k);
         let mut sc = SC::new_streamcipher_lioness(&k);
-        sc.xor_read(right) ?;
+        sc.apply_keystream(right);
 
         Ok(())
     }
@@ -217,7 +231,7 @@ where H: DigestLioness+Input+VariableOutput,
     }
 }
 
-pub type LionessDefault = Lioness<VarBlake2b,ChaCha>;
+pub type LionessDefault = Lioness<Blake2bMac256,ChaCha>;
 
 
 #[cfg(test)]
@@ -236,7 +250,7 @@ mod tests {
         const TEST_PLAINTEXT: &'static [u8] = b"Hello there world, I'm just a test string";
         let mut key = [0u8; RAW_KEY_SIZE];
         thread_rng().fill_bytes(&mut key);
-        let l = Lioness::<VarBlake2b,ChaCha>::new_raw(&key);
+        let l = LionessDefault::new_raw(&key);
         let mut v: Vec<u8> = TEST_PLAINTEXT.to_owned();
         assert_eq!(v,TEST_PLAINTEXT);
         l.encrypt(&mut v).unwrap();
@@ -251,7 +265,7 @@ mod tests {
 
     fn test_cipher(tests: &[Test]) {
         for t in tests {
-            let cipher = Lioness::<VarBlake2b,ChaCha>::new_raw(array_ref!(t.key.as_slice(), 0, RAW_KEY_SIZE));
+            let cipher = LionessDefault::new_raw(array_ref!(t.key.as_slice(), 0, RAW_KEY_SIZE));
             let mut block: Vec<u8> = t.input.as_slice().to_owned();
             cipher.encrypt(&mut block).unwrap();
             let want: Vec<u8> = t.output.as_slice().to_owned();
